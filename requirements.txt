@@ -1,5 +1,11 @@
 streamlit
-scikit-learn
 pandas
 numpy
-# any other libraries you use
+scikit-learn
+scipy
+websocket-client
+plotly
+python-dateutil
+requests
+urllib3
+pyarrow
