@@ -29,6 +29,8 @@ import requests
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 import urllib3
 import logging
+import sqlite3
+import uuid
 
 # Disable insecure request warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -39,9 +41,311 @@ CACHE_DIR = ".vitals_cache"
 CHUNK_SIZE = 5000  # Increased chunk size for better batch performance
 MAX_WORKERS = max(4, multiprocessing.cpu_count())  # Optimize worker count
 COMPRESSION = 'snappy'  # Fast compression for parquet files
+DB_PATH = "vitals_data.db"  # Path to SQLite database
 
 # Create cache directory if it doesn't exist
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+###############################################################################
+# DATABASE FUNCTIONALITY
+###############################################################################
+
+def init_database():
+    """Initialize the database with required tables if they don't exist"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Create metadata table to track datasets
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS datasets (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        upload_date TIMESTAMP,
+        num_records INTEGER,
+        description TEXT,
+        source TEXT
+    )
+    ''')
+    
+    # Create table for vital signs data
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS vital_signs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_id TEXT,
+        TimeStr TEXT,
+        TimeObj TIMESTAMP,
+        DevSerial TEXT,
+        SourceFile TEXT,
+        rawMannequin TEXT,
+        Course TEXT,
+        Sim TEXT,
+        overrideMannequin TEXT,
+        DateStr TEXT,
+        Scenario TEXT,
+        InSimWindow INTEGER,
+        IsValid INTEGER,
+        FOREIGN KEY (dataset_id) REFERENCES datasets(id)
+    )
+    ''')
+    
+    # Create table for vital sign values
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS vital_values (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vital_sign_id INTEGER,
+        vital_name TEXT,
+        vital_value REAL,
+        vital_status TEXT,
+        FOREIGN KEY (vital_sign_id) REFERENCES vital_signs(id)
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def save_to_database(df, name="Uploaded Data", description="", source=""):
+    """
+    Save DataFrame to SQLite database
+    
+    Args:
+        df: DataFrame with vital signs data
+        name: Name of the dataset
+        description: Description of the dataset
+        source: Source of the dataset (e.g., file path)
+        
+    Returns:
+        dataset_id: ID of the saved dataset
+    """
+    if df.empty:
+        return None
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Generate a unique ID for this dataset
+    dataset_id = str(uuid.uuid4())
+    
+    # Insert dataset metadata
+    cursor.execute(
+        "INSERT INTO datasets (id, name, upload_date, num_records, description, source) VALUES (?, ?, ?, ?, ?, ?)",
+        (dataset_id, name, datetime.now(), len(df), description, source)
+    )
+    
+    # Insert vital signs data in batches
+    batch_size = 1000
+    for i in range(0, len(df), batch_size):
+        batch_df = df.iloc[i:i+batch_size]
+        
+        for _, row in batch_df.iterrows():
+            # Insert basic vital sign record
+            cursor.execute(
+                """
+                INSERT INTO vital_signs 
+                (dataset_id, TimeStr, TimeObj, DevSerial, SourceFile, rawMannequin, 
+                Course, Sim, overrideMannequin, DateStr, Scenario, InSimWindow, IsValid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dataset_id,
+                    row.get("TimeStr", None),
+                    row.get("TimeObj", None).isoformat() if row.get("TimeObj") else None,
+                    row.get("DevSerial", None),
+                    row.get("SourceFile", None),
+                    row.get("rawMannequin", None),
+                    row.get("Course", None),
+                    row.get("Sim", None),
+                    row.get("overrideMannequin", None),
+                    row.get("DateStr", None),
+                    row.get("Scenario", None),
+                    1 if row.get("InSimWindow", False) else 0,
+                    1 if row.get("IsValid", False) else 0
+                )
+            )
+            
+            # Get the ID of the inserted vital sign record
+            vital_sign_id = cursor.lastrowid
+            
+            # Insert vital values
+            for col in row.index:
+                # Skip non-vital columns and status columns
+                if col in ["TimeStr", "TimeObj", "DevSerial", "SourceFile", "rawMannequin",
+                          "Course", "Sim", "overrideMannequin", "DateStr", "Scenario",
+                          "InSimWindow", "IsValid", "ElapsedMin"] or col.endswith("_status"):
+                    continue
+                
+                # Get value and status
+                value = row.get(col)
+                status = row.get(f"{col}_status", "valid")
+                
+                if pd.notna(value):
+                    cursor.execute(
+                        "INSERT INTO vital_values (vital_sign_id, vital_name, vital_value, vital_status) VALUES (?, ?, ?, ?)",
+                        (vital_sign_id, col, float(value), status)
+                    )
+    
+    conn.commit()
+    conn.close()
+    
+    return dataset_id
+
+def load_from_database(dataset_id=None):
+    """
+    Load vital signs data from SQLite database
+    
+    Args:
+        dataset_id: ID of the dataset to load. If None, loads the most recent dataset.
+        
+    Returns:
+        DataFrame with vital signs data
+    """
+    conn = sqlite3.connect(DB_PATH)
+    
+    # Get dataset ID if not provided
+    if dataset_id is None:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM datasets ORDER BY upload_date DESC LIMIT 1")
+        result = cursor.fetchone()
+        if result:
+            dataset_id = result[0]
+        else:
+            conn.close()
+            return pd.DataFrame()  # No datasets available
+    
+    # Load basic vital sign records
+    vital_signs_df = pd.read_sql_query(
+        "SELECT * FROM vital_signs WHERE dataset_id = ?",
+        conn,
+        params=(dataset_id,)
+    )
+    
+    if vital_signs_df.empty:
+        conn.close()
+        return pd.DataFrame()
+    
+    # Convert boolean columns
+    vital_signs_df["InSimWindow"] = vital_signs_df["InSimWindow"].astype(bool)
+    vital_signs_df["IsValid"] = vital_signs_df["IsValid"].astype(bool)
+    
+    # Convert TimeObj back to datetime
+    vital_signs_df["TimeObj"] = pd.to_datetime(vital_signs_df["TimeObj"])
+    
+    # Load vital values
+    vital_values_df = pd.read_sql_query(
+        """
+        SELECT v.vital_sign_id, v.vital_name, v.vital_value, v.vital_status
+        FROM vital_values v
+        JOIN vital_signs s ON v.vital_sign_id = s.id
+        WHERE s.dataset_id = ?
+        """,
+        conn,
+        params=(dataset_id,)
+    )
+    
+    conn.close()
+    
+    if vital_values_df.empty:
+        return vital_signs_df
+    
+    # Pivot vital values to get them in the right format
+    # First, create DataFrames for values and statuses
+    values_df = vital_values_df.pivot(
+        index="vital_sign_id",
+        columns="vital_name",
+        values="vital_value"
+    )
+    
+    status_df = vital_values_df.pivot(
+        index="vital_sign_id",
+        columns="vital_name",
+        values="vital_status"
+    )
+    
+    # Rename status columns
+    status_df.columns = [f"{col}_status" for col in status_df.columns]
+    
+    # Merge pivoted data with vital signs
+    values_df.reset_index(inplace=True)
+    status_df.reset_index(inplace=True)
+    
+    result_df = pd.merge(
+        vital_signs_df,
+        values_df,
+        left_on="id",
+        right_on="vital_sign_id",
+        how="left"
+    )
+    
+    result_df = pd.merge(
+        result_df,
+        status_df,
+        left_on="id",
+        right_on="vital_sign_id",
+        how="left"
+    )
+    
+    # Drop database IDs from the final DataFrame
+    result_df.drop(columns=["id", "vital_sign_id_x", "vital_sign_id_y", "dataset_id"], 
+                  errors="ignore", inplace=True)
+    
+    return result_df
+
+def get_database_datasets():
+    """
+    Get list of available datasets in the database
+    
+    Returns:
+        DataFrame with dataset information
+    """
+    conn = sqlite3.connect(DB_PATH)
+    datasets_df = pd.read_sql_query(
+        "SELECT id, name, upload_date, num_records, description, source FROM datasets ORDER BY upload_date DESC",
+        conn
+    )
+    conn.close()
+    
+    if not datasets_df.empty:
+        # Convert upload_date to datetime
+        datasets_df["upload_date"] = pd.to_datetime(datasets_df["upload_date"])
+        # Format the date for display
+        datasets_df["upload_date_formatted"] = datasets_df["upload_date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    
+    return datasets_df
+
+def delete_database_dataset(dataset_id):
+    """
+    Delete a dataset from the database
+    
+    Args:
+        dataset_id: ID of the dataset to delete
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # First delete related vital values
+    cursor.execute(
+        """
+        DELETE FROM vital_values 
+        WHERE vital_sign_id IN (
+            SELECT id FROM vital_signs WHERE dataset_id = ?
+        )
+        """,
+        (dataset_id,)
+    )
+    
+    # Delete vital signs
+    cursor.execute(
+        "DELETE FROM vital_signs WHERE dataset_id = ?",
+        (dataset_id,)
+    )
+    
+    # Delete dataset
+    cursor.execute(
+        "DELETE FROM datasets WHERE id = ?",
+        (dataset_id,)
+    )
+    
+    conn.commit()
+    conn.close()
 
 ###############################################################################
 # EVENT DETECTION & TIME SERIES ANALYSIS
@@ -1898,6 +2202,9 @@ def clear_cache():
     return True
 
 def main():
+    # Initialize database
+    init_database()
+
     tabs = st.tabs(["Home", "Data Explorer", "CPG Compliance", "Visualization", "Real-Time Monitor"])
 
     ###########################################################################
@@ -1921,6 +2228,7 @@ def main():
         - **Data Ingestion & Explorer**: Load Propaq JSON files, filter by date/time, and see relevant descriptive stats.
         - **CPG Compliance**: Quickly compute how many seconds your team spent outside target ranges for TBI, Sepsis, Burn, or other scenarios.
         - **Visualization**: Graph trends (line, bar, etc.) to see how vitals changed over time.
+        - **Database Storage**: Store and access data without needing local file access.
 
         > **Note**: This is a demonstration. Future enhancements would tie directly to Wi-Fi streaming, automatically ingest data, and provide real-time feedback mid-simulation!
         """)
@@ -1936,18 +2244,103 @@ def main():
     with tabs[1]:
         st.header("Data Explorer")
 
-        folder_path = st.text_input("Propaq JSON folder path", "/Users/rajveersingh/Downloads/propaq_data2/")
-        if st.button("Load Data"):
-            with st.spinner("Loading & processing data..."):
-                df = load_and_sort_data(folder_path)
-            if df.empty:
-                st.error("No data found or parse error.")
+        # Create two columns for the load data section
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Load Data from Files")
+            folder_path = st.text_input("Propaq JSON folder path", "/Users/rajveersingh/Downloads/propaq_data2/")
+            
+            if st.button("Load Data from Files"):
+                with st.spinner("Loading & processing data..."):
+                    df = load_and_sort_data(folder_path)
+                if df.empty:
+                    st.error("No data found or parse error.")
+                else:
+                    st.session_state["df"] = df
+                    st.session_state["data_source"] = "files"
+                    st.session_state["folder_path"] = folder_path
+                    st.success(f"Loaded {len(df)} rows from {folder_path}!")
+                    
+                    # Add option to save to database
+                    if st.button("Save to Database"):
+                        with st.spinner("Saving data to database..."):
+                            dataset_id = save_to_database(df, 
+                                                         name=f"Data from {os.path.basename(folder_path)}", 
+                                                         description="Loaded from local files", 
+                                                         source=folder_path)
+                            if dataset_id:
+                                st.success("Data successfully saved to database!")
+                            else:
+                                st.error("Failed to save data to database.")
+        
+        with col2:
+            st.subheader("Load Data from Database")
+            
+            # Get available datasets
+            datasets = get_database_datasets()
+            
+            if datasets.empty:
+                st.info("No datasets available in the database.")
             else:
-                st.session_state["df"] = df
-                st.success(f"Loaded {len(df)} rows from {folder_path}!")
+                # Format dataset info for selectbox
+                dataset_options = [f"{row['name']} - {row['upload_date_formatted']} ({row['num_records']} records)" 
+                                   for _, row in datasets.iterrows()]
+                dataset_ids = datasets['id'].tolist()
+                
+                selected_index = st.selectbox(
+                    "Select a dataset to load", 
+                    range(len(dataset_options)),
+                    format_func=lambda i: dataset_options[i]
+                )
+                
+                if st.button("Load from Database"):
+                    with st.spinner("Loading data from database..."):
+                        selected_dataset_id = dataset_ids[selected_index]
+                        df = load_from_database(selected_dataset_id)
+                    
+                    if df.empty:
+                        st.error("Failed to load data from database.")
+                    else:
+                        st.session_state["df"] = df
+                        st.session_state["data_source"] = "database"
+                        st.session_state["dataset_id"] = selected_dataset_id
+                        st.success(f"Loaded {len(df)} rows from database!")
+                
+                # Option to delete dataset
+                if st.button("Delete Selected Dataset"):
+                    with st.spinner("Deleting dataset..."):
+                        selected_dataset_id = dataset_ids[selected_index]
+                        delete_database_dataset(selected_dataset_id)
+                        st.success("Dataset deleted successfully!")
+                        st.experimental_rerun()
+
+        # Attempt to auto-load data from database if no data is loaded
+        if "df" not in st.session_state:
+            # Check if there's data in the database
+            datasets = get_database_datasets()
+            if not datasets.empty:
+                with st.spinner("Auto-loading most recent data from database..."):
+                    df = load_from_database()  # Loads the most recent dataset
+                if not df.empty:
+                    st.session_state["df"] = df
+                    st.session_state["data_source"] = "database"
+                    st.info("Automatically loaded most recent data from database. Use the options above to load different data.")
 
         if "df" in st.session_state:
             df = st.session_state["df"]
+            
+            # Display data source info
+            if st.session_state.get("data_source") == "files":
+                st.info(f"Data source: Local files from {st.session_state.get('folder_path', 'unknown path')}")
+            elif st.session_state.get("data_source") == "database":
+                dataset_id = st.session_state.get("dataset_id")
+                dataset_info = datasets[datasets['id'] == dataset_id].iloc[0] if dataset_id and not datasets.empty else None
+                if dataset_info is not None:
+                    st.info(f"Data source: Database - {dataset_info['name']} (Uploaded: {dataset_info['upload_date_formatted']})")
+            
+            # Data exploration section
+            st.subheader("Explore Data")
             
             # Always filter to only show data within simulation windows
             df = df[df["InSimWindow"] == True]
@@ -2012,6 +2405,25 @@ def main():
                 st.write(filtered_df[numeric_cols].describe())
             else:
                 st.write("*No numeric columns found in this filtered set.*")
+                
+            # Option to save filtered data
+            if st.button("Save Filtered Data to Database"):
+                with st.spinner("Saving filtered data to database..."):
+                    description = f"Filtered data - Sim: {sim_choice}, Date: {date_choice}, Mannequin: {man_choice}"
+                    if start_time_str or end_time_str:
+                        description += f" - Time range: {start_time_str} to {end_time_str}"
+                    
+                    dataset_id = save_to_database(
+                        filtered_df, 
+                        name=f"Filtered Data {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                        description=description,
+                        source=f"Filtered from: {st.session_state.get('data_source', 'unknown')}"
+                    )
+                    
+                    if dataset_id:
+                        st.success("Filtered data successfully saved to database!")
+                    else:
+                        st.error("Failed to save filtered data to database.")
 
     ###########################################################################
     # TAB 2: CPG COMPLIANCE
