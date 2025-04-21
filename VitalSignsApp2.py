@@ -2251,6 +2251,49 @@ def main():
             st.subheader("Load Data from Files")
             folder_path = st.text_input("Propaq JSON folder path", "/Users/rajveersingh/Downloads/propaq_data2/")
             
+            # Add a file upload section
+            st.write("---")
+            st.subheader("Or Upload JSON Files")
+            uploaded_files = st.file_uploader("Upload Propaq JSON files", type=["json"], accept_multiple_files=True)
+            
+            if uploaded_files:
+                if st.button("Process Uploaded Files"):
+                    with st.spinner("Processing uploaded files..."):
+                        # Create a temporary directory for the uploaded files
+                        temp_dir = Path("temp_uploads")
+                        temp_dir.mkdir(exist_ok=True)
+                        
+                        try:
+                            # Save uploaded files to temp directory
+                            for uploaded_file in uploaded_files:
+                                file_path = temp_dir / uploaded_file.name
+                                with open(file_path, "wb") as f:
+                                    f.write(uploaded_file.getbuffer())
+                            
+                            # Process the files
+                            df = load_and_sort_data(str(temp_dir))
+                            
+                            if df.empty:
+                                st.error("No valid data found in uploaded files.")
+                            else:
+                                st.session_state["df"] = df
+                                st.session_state["data_source"] = "uploaded_files"
+                                st.success(f"Loaded {len(df)} rows from {len(uploaded_files)} uploaded files!")
+                                
+                                # Automatically save to database
+                                dataset_id = save_to_database(
+                                    df, 
+                                    name=f"Uploaded Files {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                                    description=f"Data from {len(uploaded_files)} uploaded files",
+                                    source="File Upload"
+                                )
+                                
+                                if dataset_id:
+                                    st.info("Data automatically saved to database for future access.")
+                        finally:
+                            # Clean up temp directory
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+            
             if st.button("Load Data from Files"):
                 with st.spinner("Loading & processing data..."):
                     df = load_and_sort_data(folder_path)
